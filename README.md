@@ -140,8 +140,6 @@ npm run build
 
 本地验证覆盖 Python 编译与测试、前端生产构建，以及“登录 → RAG SSE → 会话持久化 → Trace 查询”的端到端链路。
 
-用于简历时可参考 [项目经历文案](docs/resume-project-experience.md)，其中同时列出了面试表述边界。
-
 ## 进一步演进
 
 - 将本地混合召回替换为 BM25 + 向量检索，并增加离线 Recall@K / MRR 评测集。
