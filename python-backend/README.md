@@ -1,6 +1,6 @@
 # Python Agentic RAG 后端
 
-这是原 Java 后端的 Python 版本，直接兼容项目现有 React 前端。默认使用 SQLite 持久化，首次启动会自动导入 `resources/docs/knowledge/product` 中的产品资料，无需 PostgreSQL、Redis、RocketMQ 或向量数据库即可完成演示。
+这是原 Java 后端的 Python 版本，直接兼容项目现有 React 前端。业务数据使用 SQLite，向量由 Qdrant Local Mode 持久化；首次启动会自动导入 `resources/docs/knowledge/product` 中的产品资料。
 
 ## Agent + RAG 链路
 
@@ -8,12 +8,12 @@
 
 1. 问题改写：结合术语映射和最近会话解决指代问题。
 2. 意图路由：将问题路由到产品介绍、价格、交付、售前或发布意图。
-3. 工具调用：Agent 通过 `ToolRegistry` 调用产品知识检索工具。
-4. 混合检索：中文字符/双字词与英文词的加权召回，并按意图重排。
-5. 上下文工程：采用 Gather、Select、Structure、Compress 流程组织证据和记忆。
-6. 模型路由：优先调用 OpenAI 兼容模型，失败时切换备用模型，最后降级为本地有依据回答。
+3. ReAct 规划：模型读取 `ToolRegistry` 生成的 Function Calling Schema，自主选择工具。
+4. 混合检索：BM25 与 Embedding + Qdrant 双路召回，使用 RRF 融合和 Rerank 重排。
+5. Observation：工具结果以 `role=tool` 回填，模型可继续选择工具，最多执行限定轮次。
+6. 模型路由：优先调用 OpenAI 兼容模型，失败时切换备用模型，最后降级为本地 Planner 与有依据回答。
 7. SSE 输出：兼容原前端的 `meta/message/finish/done` 事件。
-8. Trace：记录改写、意图、工具、上下文和生成节点。
+8. Trace：逐轮记录 Plan、Action、Observation 和最终生成节点。
 
 ## 启动
 
@@ -43,4 +43,6 @@ $env:LLM_MODEL = "deepseek-chat"
 ```
 
 不配置 Key 时系统仍可运行，会使用本地检索证据生成可核验的降级回答。
+
+Embedding 与 Rerank 可分别通过 `EMBEDDING_*`、`RERANK_*` 环境变量接入服务；留空时使用本地确定性实现。完整字段见 `.env.example`。
 

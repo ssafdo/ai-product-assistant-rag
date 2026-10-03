@@ -19,6 +19,23 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from .config import settings
 from .database import db, dumps, hash_password, loads, new_id, now_iso, verify_password
 from .rag import agent, document_to_api, get_document, ingest_text, seed_product_knowledge, structure_chunks, tokenize
+from .retrieval import close_vector_store, index_chunks, remove_chunks
+
+
+def vector_rows(chunk_ids: list[str]) -> list[dict[str, Any]]:
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" for _ in chunk_ids)
+    with db.connect() as connection:
+        rows = connection.execute(
+            f"""SELECT c.id chunk_id, c.doc_id document_id, c.content, c.content_hash,
+                       d.doc_name document_name, kb.name knowledge_base
+                FROM chunks c JOIN documents d ON d.id=c.doc_id
+                JOIN knowledge_bases kb ON kb.id=c.kb_id
+                WHERE c.id IN ({placeholders}) AND c.enabled=1 AND d.enabled=1""",
+            chunk_ids,
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def ok(data: Any = None) -> dict[str, Any]:
@@ -91,7 +108,10 @@ async def lifespan(_: FastAPI):
     db.initialize()
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     seed_product_knowledge()
-    yield
+    try:
+        yield
+    finally:
+        close_vector_store()
 
 
 app = FastAPI(
@@ -478,13 +498,20 @@ def rebuild_document(doc_id: str, _: dict[str, Any] = Depends(admin_user)) -> di
 def enable_document(doc_id: str, value: bool, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     with db.connect() as connection:
         connection.execute("UPDATE documents SET enabled=?, update_time=? WHERE id=?", (int(value), now_iso(), doc_id))
+        chunk_ids = [row["id"] for row in connection.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
+    if value:
+        index_chunks(vector_rows(chunk_ids))
+    else:
+        remove_chunks(chunk_ids)
     return ok()
 
 
 @app.delete(PREFIX + "/knowledge-base/docs/{doc_id}")
 def delete_document(doc_id: str, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     with db.connect() as connection:
+        chunk_ids = [row["id"] for row in connection.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
         connection.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+    remove_chunks(chunk_ids)
     return ok()
 
 
@@ -530,6 +557,7 @@ def create_chunk(doc_id: str, payload: dict[str, Any] = Body(...), _: dict[str, 
             (chunk_id, document_row["kb_id"], doc_id, index, content, digest, len(content), len(tokenize(content)), timestamp, timestamp),
         )
         row = connection.execute("SELECT * FROM chunks WHERE id=?", (chunk_id,)).fetchone()
+    index_chunks(vector_rows([chunk_id]))
     return ok(chunk_api(dict(row)))
 
 
@@ -542,6 +570,7 @@ def update_chunk(doc_id: str, chunk_id: str, payload: dict[str, Any] = Body(...)
             "UPDATE chunks SET content=?, content_hash=?, char_count=?, token_count=?, update_time=? WHERE id=? AND doc_id=?",
             (content, digest, len(content), len(tokenize(content)), now_iso(), chunk_id, doc_id),
         )
+    index_chunks(vector_rows([chunk_id]))
     return ok()
 
 
@@ -549,6 +578,7 @@ def update_chunk(doc_id: str, chunk_id: str, payload: dict[str, Any] = Body(...)
 def delete_chunk(doc_id: str, chunk_id: str, _: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     with db.connect() as connection:
         connection.execute("DELETE FROM chunks WHERE id=? AND doc_id=?", (chunk_id, doc_id))
+    remove_chunks([chunk_id])
     return ok()
 
 
@@ -571,7 +601,12 @@ def _set_chunk_state(doc_id: str, chunk_ids: list[str] | None, state: int) -> di
                 (state, now_iso(), doc_id, *chunk_ids),
             )
         else:
+            chunk_ids = [row["id"] for row in connection.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
             connection.execute("UPDATE chunks SET enabled=?, update_time=? WHERE doc_id=?", (state, now_iso(), doc_id))
+    if state:
+        index_chunks(vector_rows(chunk_ids or []))
+    else:
+        remove_chunks(chunk_ids or [])
     return ok()
 
 

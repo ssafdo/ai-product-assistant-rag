@@ -8,9 +8,9 @@
 [![CI](https://github.com/ssafdo/ai-product-assistant-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/ssafdo/ai-product-assistant-rag/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-这不是一个只封装大模型接口的聊天 Demo。项目实现了从文档入库、问题改写、意图路由、多路检索、上下文构建、模型生成到 SSE 流式回答和链路追踪的完整闭环，并提供知识库、意图树、术语映射、用户和 Trace 管理后台。
+这不是一个只封装大模型接口的聊天 Demo。项目实现了从文档入库、Embedding、BM25 + 向量混合召回、Rerank 到多轮 ReAct 工具调用、SSE 回答和链路追踪的完整闭环，并提供知识库、意图树、术语映射、用户和 Trace 管理后台。
 
-Python 后端默认使用 SQLite，可在不安装 PostgreSQL、Redis、消息队列和向量数据库的情况下完成端到端演示；配置 OpenAI 兼容模型后即可切换为完整的生成式回答。
+Python 后端使用 SQLite 保存业务数据，Qdrant Local Mode 持久化向量；默认的确定性 Embedding、Rerank 和 ReAct Planner 可离线演示，配置兼容 API 后即可切换为真实 Embedding、Rerank 与大模型 Function Calling。
 
 ## 界面预览
 
@@ -24,38 +24,40 @@ Python 后端默认使用 SQLite，可在不安装 PostgreSQL、Redis、消息�
 flowchart LR
     Q[用户问题] --> RW[问题改写]
     RW --> IR[意图路由]
-    IR --> TR[Tool Registry]
-    TR --> RET[混合检索与重排]
-    RET --> CTX[GSSC 上下文构建]
-    CTX --> LLM{模型路由}
-    LLM -->|主模型| GEN[生成回答]
-    LLM -->|故障| BACKUP[备用模型]
-    BACKUP -->|仍不可用| LOCAL[本地有依据降级]
-    GEN --> SSE[SSE 流式输出]
-    LOCAL --> SSE
+    IR --> PLAN[ReAct Planner]
+    PLAN -->|Action| TR[Tool Registry]
+    TR --> BM25[BM25 稀疏召回]
+    TR --> VEC[Embedding + Qdrant]
+    BM25 --> RRF[RRF 融合]
+    VEC --> RRF
+    RRF --> RR[Rerank]
+    RR -->|Observation| PLAN
+    TR -->|其他业务 Observation| PLAN
+    PLAN -->|Final Answer| SSE[SSE 流式输出]
     RW -.-> TRACE[Trace 可观测链路]
     IR -.-> TRACE
-    RET -.-> TRACE
-    CTX -.-> TRACE
-    LLM -.-> TRACE
+    PLAN -.-> TRACE
+    TR -.-> TRACE
 ```
 
 一次问答会记录以下可观测节点：
 
 1. `Rewrite`：结合术语映射和最近会话解决指代与表达差异。
 2. `Intent Routing`：识别产品介绍、套餐价格、交付部署、售前支持和版本发布等意图。
-3. `Tool / Retrieval`：Agent 通过工具注册中心调用知识检索，并执行意图定向重排。
-4. `Context Engineering`：采用 Gather、Select、Structure、Compress 组织证据与短期记忆。
-5. `Generation`：主备模型容错，模型不可用时返回带引用的本地有依据回答。
+3. `Plan / Action`：模型读取工具 JSON Schema，自主选择工具及参数。
+4. `Observation`：执行工具并将结构化结果以 `role=tool` 回填，模型据此继续规划。
+5. `Retrieval`：BM25 与 Qdrant 向量双路召回，RRF 融合后由 Rerank 模型重排。
+6. `Generation`：在最大步数保护内结束循环；模型不可用时返回带引用的本地有依据回答。
 
 ## 项目亮点
 
-- **Agentic RAG**：将知识检索和业务查询统一抽象为工具，通过受控 Agent 编排完成检索增强生成。
-- **可解释回答**：回答使用 `[资料N]` 标注依据，并返回命中文档、分块内容、分数和检索通道。
+- **真实 ReAct 工具循环**：不是固定工作流伪装成 Agent；模型通过 Function Calling 自主选择工具，支持多轮 Action / Observation、继续规划、工具异常回填和最大步数保护。
+- **四阶段混合检索**：标准 BM25 稀疏召回与 Qdrant 向量召回并行，经 RRF 消除分数量纲差异，再使用独立 Rerank 模型重排。
+- **可插拔模型能力**：Embedding 和 Rerank 均支持独立兼容 API；未配置 Key 时使用确定性本地实现，确保仓库可直接运行。
+- **可解释回答**：回答使用 `[资料N]` 标注依据，并返回 BM25、向量、Rerank 三阶段分数和检索通道。
 - **模型路由与降级**：支持两个 OpenAI 兼容模型顺序容错；无 API Key 时仍能完整运行和演示。
-- **上下文工程**：多轮历史、问题改写、意图提示和检索证据均受字符预算约束，避免上下文无限膨胀。
 - **知识治理**：支持文档上传、结构感知切分、分块编辑、启停、重建、入库日志和流水线管理。
-- **端到端可观测性**：记录会话、任务、耗时、状态与 5 类核心节点，便于定位召回和生成问题。
+- **端到端可观测性**：逐轮记录 Plan、Action、Observation、模型路由、耗时和结果，便于定位工具选择与召回问题。
 - **前后端完整产品**：React 管理台兼容 70+ 个 FastAPI 接口，包含认证、聊天、知识库和运营看板。
 
 ## 技术栈
@@ -63,7 +65,8 @@ flowchart LR
 | 模块 | 技术 |
 | --- | --- |
 | Python 后端 | Python 3.11+、FastAPI、SQLite、httpx、Pydantic |
-| Agent / RAG | Tool Registry、Intent Routing、Hybrid Retrieval、GSSC Context、Model Router |
+| Agent / RAG | ReAct、OpenAI Function Calling、Tool Registry、BM25、RRF、Rerank |
+| Embedding / Vector DB | OpenAI-compatible Embeddings、Qdrant Local Mode |
 | 前端 | React 18、TypeScript、Vite、Tailwind CSS、Zustand、Recharts |
 | 文档处理 | Markdown / TXT、PDF、DOCX、结构感知切分 |
 | 接口与流式输出 | REST、SSE、OpenAI-compatible API |
@@ -106,6 +109,14 @@ npm run dev
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
+
+# 可选：真实 Embedding 与 Rerank 服务
+EMBEDDING_API_KEY=your-api-key
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_MODEL=text-embedding-3-small
+RERANK_API_KEY=your-api-key
+RERANK_URL=https://api.siliconflow.cn/v1/rerank
+RERANK_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
 适用于 DeepSeek、通义千问、SiliconFlow 和其他 OpenAI 兼容服务。不配置 Key 时自动使用本地有依据降级回答。
@@ -117,7 +128,9 @@ LLM_MODEL=deepseek-chat
 ├── python-backend/         # 推荐后端：FastAPI、Agent、RAG、SQLite、Trace
 │   ├── app/
 │   │   ├── main.py         # 认证、知识库、聊天、管理台等 API
-│   │   ├── rag.py          # Agent 编排、检索、上下文与模型路由
+│   │   ├── rag.py          # 产品 Agent 编排、工具与 Trace
+│   │   ├── react_agent.py  # Tool Registry、Function Calling 与 ReAct 循环
+│   │   ├── retrieval.py    # Embedding、Qdrant、BM25、RRF 与 Rerank
 │   │   ├── database.py     # SQLite Schema、认证与种子数据
 │   │   └── config.py       # 环境配置
 │   └── tests/              # Python 单元测试
@@ -142,9 +155,9 @@ npm run build
 
 ## 进一步演进
 
-- 将本地混合召回替换为 BM25 + 向量检索，并增加离线 Recall@K / MRR 评测集。
+- 增加离线 Recall@K、MRR、NDCG 评测集和检索参数自动调优。
 - 引入 Redis 会话缓存和任务队列，支持大文件异步入库与并发限流。
-- 增加 MCP / Function Calling 业务工具，让 Agent 查询订单、配置和任务状态。
+- 增加 MCP 业务工具，让 Agent 查询订单、客户配置和服务健康状态。
 - 使用 Docker Compose 提供 PostgreSQL + pgvector 的生产化部署方案。
 
 ## 项目说明

@@ -1,29 +1,18 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
-import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
 from .config import settings
-from .database import db, dumps, loads, new_id, now_iso
-
-
-def tokenize(text: str) -> list[str]:
-    normalized = text.lower()
-    latin = re.findall(r"[a-z0-9][a-z0-9_.+-]*", normalized)
-    chinese_runs = re.findall(r"[\u4e00-\u9fff]+", normalized)
-    chinese: list[str] = []
-    for run in chinese_runs:
-        chinese.extend(run)
-        chinese.extend(run[index : index + 2] for index in range(max(0, len(run) - 1)))
-    return latin + chinese
+from .database import db, dumps, new_id, now_iso
+from .react_agent import OpenAIToolCallingModel, ReActEngine, ToolRegistry
+from .retrieval import HybridRetriever, SearchHit, index_chunks, remove_chunks, tokenize
 
 
 def structure_chunks(text: str, max_chars: int = 900, overlap: int = 120) -> list[str]:
@@ -68,9 +57,14 @@ def ingest_text(
     timestamp = now_iso()
     document_id = document_id or new_id()
     chunks = structure_chunks(text) if chunk_strategy == "structure" else structure_chunks(text, 700, 100)
+    indexed_rows: list[dict[str, Any]] = []
+    removed_chunk_ids: list[str] = []
     with db.connect() as connection:
         existing = connection.execute("SELECT id FROM documents WHERE id = ?", (document_id,)).fetchone()
         if existing:
+            removed_chunk_ids = [
+                row["id"] for row in connection.execute("SELECT id FROM chunks WHERE doc_id = ?", (document_id,))
+            ]
             connection.execute("DELETE FROM chunks WHERE doc_id = ?", (document_id,))
             connection.execute(
                 "UPDATE documents SET raw_text=?, status='processing', update_time=? WHERE id=?",
@@ -98,16 +92,25 @@ def ingest_text(
             )
         for index, content in enumerate(chunks):
             content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            chunk_id = new_id()
             connection.execute(
                 """INSERT INTO chunks(
                     id, kb_id, doc_id, chunk_index, content, content_hash, char_count,
                     token_count, enabled, create_time, update_time
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
                 (
-                    new_id(), kb_id, document_id, index, content, content_hash,
+                    chunk_id, kb_id, document_id, index, content, content_hash,
                     len(content), len(tokenize(content)), timestamp, timestamp,
                 ),
             )
+            indexed_rows.append({
+                "chunk_id": chunk_id,
+                "document_id": document_id,
+                "document_name": doc_name,
+                "knowledge_base": kb_id,
+                "content": content,
+                "content_hash": content_hash,
+            })
         connection.execute(
             "UPDATE documents SET status='ready', update_time=? WHERE id=?",
             (timestamp, document_id),
@@ -120,6 +123,8 @@ def ingest_text(
             ) VALUES (?, ?, 'success', 'chunk', ?, ?, ?, ?, ?, ?)""",
             (new_id(), document_id, chunk_strategy, duration, len(chunks), timestamp, now_iso(), timestamp),
         )
+    remove_chunks(removed_chunk_ids)
+    index_chunks(indexed_rows)
     return get_document(document_id)
 
 
@@ -172,78 +177,6 @@ def seed_product_knowledge() -> None:
         )
 
 
-@dataclass
-class SearchHit:
-    chunk_id: str
-    document_id: str
-    document_name: str
-    knowledge_base: str
-    content: str
-    score: float
-    channel: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "chunkId": self.chunk_id,
-            "documentId": self.document_id,
-            "documentName": self.document_name,
-            "knowledgeBase": self.knowledge_base,
-            "content": self.content,
-            "score": round(self.score, 4),
-            "channel": self.channel,
-        }
-
-
-class HybridRetriever:
-    def rewrite(self, question: str, history: list[dict[str, str]]) -> str:
-        rewritten = question.strip()
-        with db.connect() as connection:
-            mappings = connection.execute(
-                "SELECT source_term, target_term FROM mappings WHERE enabled=1 ORDER BY priority DESC"
-            ).fetchall()
-        for row in mappings:
-            if row["source_term"] in rewritten:
-                rewritten += f" {row['target_term']}"
-        if history and len(rewritten) < 18 and re.search(r"(它|这个|那|呢|如何|区别)", rewritten):
-            previous = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
-            if previous:
-                rewritten = f"基于上一问“{previous[:100]}”，{rewritten}"
-        return rewritten
-
-    def search(self, query: str, intent_code: str | None = None, top_k: int | None = None) -> list[SearchHit]:
-        query_tokens = set(tokenize(query))
-        if not query_tokens:
-            return []
-        with db.connect() as connection:
-            rows = connection.execute(
-                """SELECT c.id chunk_id, c.doc_id, c.content, d.doc_name, kb.name kb_name
-                   FROM chunks c JOIN documents d ON d.id=c.doc_id
-                   JOIN knowledge_bases kb ON kb.id=c.kb_id
-                   WHERE c.enabled=1 AND d.enabled=1 AND d.status='ready'"""
-            ).fetchall()
-        hits: list[SearchHit] = []
-        intent_terms = set(tokenize(intent_code or ""))
-        for row in rows:
-            content_tokens = set(tokenize(row["content"]))
-            overlap = query_tokens & content_tokens
-            if not overlap:
-                continue
-            lexical = sum(2.0 if len(token) > 1 else 0.35 for token in overlap)
-            coverage = len(overlap) / max(1, len(query_tokens))
-            exact_bonus = 2.0 if query.lower() in row["content"].lower() else 0.0
-            intent_bonus = 0.6 * len(intent_terms & content_tokens)
-            length_penalty = math.log(max(20, len(content_tokens)), 10)
-            score = (lexical + 5 * coverage + exact_bonus + intent_bonus) / length_penalty
-            hits.append(
-                SearchHit(
-                    row["chunk_id"], row["doc_id"], row["doc_name"], row["kb_name"],
-                    row["content"], score, "hybrid-global" if not intent_code else "intent-directed",
-                )
-            )
-        hits.sort(key=lambda item: item.score, reverse=True)
-        return hits[: top_k or settings.retrieval_top_k]
-
-
 class IntentRouter:
     def route(self, question: str) -> dict[str, Any]:
         query_tokens = set(tokenize(question))
@@ -260,22 +193,6 @@ class IntentRouter:
                     "prompt": row["prompt_snippet"] or "", "topK": row["top_k"] or settings.retrieval_top_k,
                 }
         return best
-
-
-class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: dict[str, tuple[str, Callable[..., Any]]] = {}
-
-    def register(self, name: str, description: str, function: Callable[..., Any]) -> None:
-        self._tools[name] = (description, function)
-
-    def execute(self, name: str, **arguments: Any) -> Any:
-        if name not in self._tools:
-            raise KeyError(f"工具 {name} 不存在")
-        return self._tools[name][1](**arguments)
-
-    def descriptions(self) -> list[dict[str, str]]:
-        return [{"name": name, "description": item[0]} for name, item in self._tools.items()]
 
 
 class ContextBuilder:
@@ -404,20 +321,107 @@ class TraceRecorder:
 
 
 class ProductAssistantAgent:
-    def __init__(self) -> None:
-        self.retriever = HybridRetriever()
+    def __init__(self, retriever: HybridRetriever | None = None, tool_model: Any | None = None) -> None:
+        self.retriever = retriever or HybridRetriever()
         self.intent_router = IntentRouter()
         self.context_builder = ContextBuilder()
         self.model_router = ModelRouter()
         self.tools = ToolRegistry()
-        self.tools.register("search_product_knowledge", "检索产品知识库并返回证据", self.retriever.search)
-        self.tools.register("get_ingestion_task", "按任务 ID 查询文档入库状态", self._get_ingestion_task)
+        self.tools.register(
+            "search_product_knowledge",
+            "使用 BM25 与 Qdrant 向量召回、RRF 融合和 Rerank 检索产品知识，回答产品问题前应优先调用。",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "要检索的完整问题"},
+                    "intent_code": {"type": "string", "description": "已识别的业务意图代码"},
+                    "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            self.retriever.search,
+        )
+        self.tools.register(
+            "get_ingestion_task",
+            "按任务 ID 查询文档入库状态、分块数量和错误信息。",
+            {
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "32 位入库任务 ID"}},
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+            self._get_ingestion_task,
+        )
+        self.tools.register(
+            "get_product_document",
+            "根据检索结果中的文档 ID 获取产品文档元数据和内容摘要，用于核验来源。",
+            {
+                "type": "object",
+                "properties": {"document_id": {"type": "string", "description": "产品文档 ID"}},
+                "required": ["document_id"],
+                "additionalProperties": False,
+            },
+            self._get_product_document,
+        )
+        self.react = ReActEngine(self.tools, tool_model or OpenAIToolCallingModel())
 
     @staticmethod
     def _get_ingestion_task(task_id: str) -> dict[str, Any]:
         with db.connect() as connection:
             row = connection.execute("SELECT * FROM ingestion_tasks WHERE id=?", (task_id,)).fetchone()
         return dict(row) if row else {"error": "未找到入库任务"}
+
+    @staticmethod
+    def _get_product_document(document_id: str) -> dict[str, Any]:
+        with db.connect() as connection:
+            row = connection.execute(
+                """SELECT d.id, d.doc_name, d.source_type, d.status, d.update_time,
+                          COUNT(c.id) chunk_count, SUBSTR(d.raw_text, 1, 1200) excerpt
+                   FROM documents d LEFT JOIN chunks c ON c.doc_id=d.id
+                   WHERE d.id=? GROUP BY d.id""",
+                (document_id,),
+            ).fetchone()
+        return dict(row) if row else {"error": "未找到产品文档"}
+
+    @staticmethod
+    def _hits_from_observations(observations: list[dict[str, Any]]) -> list[SearchHit]:
+        for observation in observations:
+            if observation["tool"] != "search_product_knowledge" or not isinstance(observation["result"], list):
+                continue
+            hits = []
+            for item in observation["result"]:
+                scores = item.get("scores") or {}
+                hits.append(SearchHit(
+                    chunk_id=item["chunkId"],
+                    document_id=item["documentId"],
+                    document_name=item["documentName"],
+                    knowledge_base=item["knowledgeBase"],
+                    content=item["content"],
+                    score=float(item.get("score", 0)),
+                    channel=item.get("channel", "bm25+qdrant+rrf+rerank"),
+                    bm25_score=float(scores.get("bm25", 0)),
+                    vector_score=float(scores.get("vector", 0)),
+                    rerank_score=float(scores.get("rerank", 0)),
+                ))
+            return hits
+        return []
+
+    @staticmethod
+    def _task_fallback(observations: list[dict[str, Any]]) -> str | None:
+        task_observation = next(
+            (item for item in observations if item["tool"] == "get_ingestion_task"),
+            None,
+        )
+        if not task_observation:
+            return None
+        result = task_observation["result"]
+        if result.get("error"):
+            return result["error"]
+        return (
+            f"入库任务 {result.get('id')} 当前状态为 {result.get('status', '未知')}，"
+            f"已生成 {result.get('chunk_count') or 0} 个分块。"
+        )
 
     async def run(
         self,
@@ -438,27 +442,58 @@ class ProductAssistantAgent:
             intent = self.intent_router.route(rewritten)
             trace.node("意图路由", "intent", started, intent, {"question": rewritten})
 
-            started = time.perf_counter()
-            hits = self.tools.execute(
-                "search_product_knowledge",
-                query=rewritten,
-                intent_code=intent["code"],
-                top_k=intent.get("topK", settings.retrieval_top_k),
+            recent_history = "\n".join(
+                f"{item['role']}: {item['content'][:600]}" for item in history[-8:]
+            ) or "无"
+            system_prompt = (
+                "你是企业 AI 产品智能助手，采用 ReAct 方式工作。根据问题自主选择注册工具；"
+                "每次收到工具 Observation 后重新判断是否继续调用工具。产品事实必须先检索，"
+                "不得编造价格、合同、客户隐私或未发布路线图。最终答案使用 [资料N] 标注证据。"
+                f"最多允许 {settings.agent_max_steps} 轮规划。"
             )
-            trace.node("知识检索工具", "tool", started, [hit.as_dict() for hit in hits], {"tool": "search_product_knowledge"})
+            user_prompt = (
+                f"[Original question]\n{question}\n\n[Rewritten question]\n{rewritten}\n\n"
+                f"[Intent code]\n{intent['code']}\n\n[Intent]\n{intent['name']}\n\n"
+                f"[Recent conversation]\n{recent_history}"
+            )
+
+            def record_react(step: int, phase: str, payload: dict[str, Any]) -> None:
+                started = time.perf_counter()
+                names = {
+                    "plan": f"ReAct 第 {step} 轮规划",
+                    "action": f"ReAct 第 {step} 轮 Action",
+                    "observation": f"ReAct 第 {step} 轮 Observation",
+                }
+                name = names[phase]
+                trace.node(name, phase, started, payload, {"step": step})
 
             started = time.perf_counter()
-            context = self.context_builder.build(question, history, hits)
-            trace.node("上下文构建", "context", started, {"chars": len(context), "evidenceCount": len(hits)})
-
-            started = time.perf_counter()
-            answer, route = await self.model_router.complete(context, intent, hits)
-            trace.node("模型路由与生成", "generation", started, {"route": route, "answerChars": len(answer)})
+            react_result = await self.react.run(system_prompt, user_prompt, record_react)
+            hits = self._hits_from_observations(react_result.observations)
+            answer = react_result.answer
+            if not answer or answer == "__LOCAL_FINAL__":
+                answer = self._task_fallback(react_result.observations) or self.model_router._grounded_fallback(hits)
+            if react_result.stopped_by_limit:
+                answer = self._task_fallback(react_result.observations) or self.model_router._grounded_fallback(hits)
+            route = react_result.route
+            trace.node(
+                "ReAct 最终回答",
+                "generation",
+                started,
+                {
+                    "route": route,
+                    "steps": react_result.steps,
+                    "observations": len(react_result.observations),
+                    "stoppedByLimit": react_result.stopped_by_limit,
+                    "answerChars": len(answer),
+                },
+            )
             thinking = ""
             if deep_thinking:
                 thinking = (
                     f"已将问题改写为“{rewritten}”，识别为“{intent['name']}”意图，"
-                    f"通过知识检索工具筛选出 {len(hits)} 条证据，并按相关性压缩上下文后生成回答。"
+                    f"Agent 完成 {react_result.steps} 轮规划并获得 {len(react_result.observations)} 次工具 Observation，"
+                    f"最终基于 {len(hits)} 条重排证据生成回答。"
                 )
             trace.finish()
             return AgentResult(answer, rewritten, intent, hits, route, trace.trace_id, task_id, thinking)
