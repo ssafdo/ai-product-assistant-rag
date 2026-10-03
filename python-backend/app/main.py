@@ -7,7 +7,7 @@ import json
 import math
 import secrets
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -678,22 +678,40 @@ async def rag_chat(
 
     async def generate():
         yield sse("meta", {"conversationId": conversation_id, "taskId": task_id})
+        token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+        async def forward_token(delta: str) -> None:
+            await token_queue.put(delta)
+
+        async def execute_agent():
+            try:
+                return await agent.run(
+                    question,
+                    conversation_id,
+                    task_id,
+                    user,
+                    history,
+                    deepThinking,
+                    on_token=forward_token,
+                    cancelled=lambda: task_id in STOPPED_TASKS,
+                )
+            finally:
+                await token_queue.put(None)
+
+        agent_task = asyncio.create_task(execute_agent())
         try:
-            result = await agent.run(question, conversation_id, task_id, user, history, deepThinking)
-            if result.thinking:
-                for index in range(0, len(result.thinking), 18):
-                    if task_id in STOPPED_TASKS:
-                        break
-                    yield sse("message", {"type": "think", "delta": result.thinking[index : index + 18]})
-                    await asyncio.sleep(0.01)
+            if deepThinking:
+                yield sse("message", {"type": "think", "delta": "正在规划工具、筛选证据并组装上下文。"})
             emitted = ""
-            for index in range(0, len(result.answer), 18):
-                if task_id in STOPPED_TASKS:
+            while True:
+                delta = await token_queue.get()
+                if delta is None:
                     break
-                delta = result.answer[index : index + 18]
+                if task_id in STOPPED_TASKS:
+                    continue
                 emitted += delta
                 yield sse("message", {"type": "response", "delta": delta})
-                await asyncio.sleep(0.01)
+            result = await agent_task
             with db.connect() as connection:
                 cursor = connection.execute(
                     "INSERT INTO messages(conversation_id, role, content, create_time) VALUES (?, 'assistant', ?, ?)",
@@ -713,6 +731,10 @@ async def rag_chat(
         except Exception as exc:
             yield sse("error", {"error": str(exc)})
         finally:
+            if not agent_task.done():
+                agent_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await agent_task
             STOPPED_TASKS.discard(task_id)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1042,13 +1064,15 @@ def dashboard_trends(metric: str, window: str = "7d", granularity: str = "day", 
 @app.get(PREFIX + "/rag/settings")
 def rag_settings(_: dict[str, Any] = Depends(admin_user)) -> dict[str, Any]:
     configured = bool(settings.llm_api_key)
+    embedding_configured = bool(settings.embedding_api_key)
+    rerank_configured = bool(settings.rerank_api_key)
     candidates = [{"id": "local-grounded-fallback", "provider": "local", "model": "extractive-grounded", "priority": 100, "enabled": True, "supportsThinking": True}]
     if configured:
         candidates.insert(0, {"id": settings.llm_model, "provider": "openai-compatible", "model": settings.llm_model, "url": settings.llm_base_url, "priority": 0, "enabled": True, "supportsThinking": True})
     return ok({
         "upload": {"maxFileSize": 50 * 1024 * 1024, "maxRequestSize": 100 * 1024 * 1024},
-        "rag": {"default": {"collectionName": "product_assistant_store", "dimension": 0, "metricType": "HYBRID"}, "queryRewrite": {"enabled": settings.query_rewrite_enabled, "maxHistoryMessages": 8, "maxHistoryChars": 4800}, "rateLimit": {"global": {"enabled": False, "maxConcurrent": 20, "maxWaitSeconds": 3, "leaseSeconds": 60, "pollIntervalMs": 100}}, "memory": {"historyKeepTurns": 4, "summaryStartTurns": 8, "summaryEnabled": True, "ttlMinutes": 0, "summaryMaxChars": 600, "titleMaxLength": 30}},
-        "ai": {"providers": {"openai-compatible": {"url": settings.llm_base_url, "apiKey": "已配置" if configured else None, "endpoints": {"chat": "/chat/completions"}}, "local": {"url": "in-process", "endpoints": {"chat": "grounded-fallback"}}}, "selection": {"failureThreshold": 1, "openDurationMs": 30000}, "stream": {"messageChunkSize": 18}, "chat": {"defaultModel": settings.llm_model if configured else "local-grounded-fallback", "deepThinkingModel": settings.llm_model if configured else "local-grounded-fallback", "candidates": candidates}, "embedding": {"defaultModel": "local-hybrid", "candidates": [{"id":"local-hybrid","provider":"local","model":"lexical-bigram","enabled":True}]}, "rerank": {"defaultModel": "weighted-hybrid", "candidates": [{"id":"weighted-hybrid","provider":"local","model":"weighted-hybrid","enabled":True}]}}
+        "rag": {"default": {"collectionName": settings.vector_collection, "dimension": settings.embedding_dimension, "metricType": "BM25_QDRANT_RRF_RERANK"}, "queryRewrite": {"enabled": settings.query_rewrite_enabled, "maxHistoryMessages": 8, "maxHistoryChars": 4800}, "rateLimit": {"global": {"enabled": False, "maxConcurrent": 20, "maxWaitSeconds": 3, "leaseSeconds": 60, "pollIntervalMs": 100}}, "memory": {"historyKeepTurns": 4, "summaryStartTurns": 8, "summaryEnabled": True, "ttlMinutes": 0, "summaryMaxChars": 600, "titleMaxLength": 30}},
+        "ai": {"providers": {"openai-compatible": {"url": settings.llm_base_url, "apiKey": "已配置" if configured else None, "endpoints": {"chat": "/chat/completions"}}, "local": {"url": "in-process", "endpoints": {"chat": "grounded-fallback"}}}, "selection": {"failureThreshold": 1, "openDurationMs": 30000}, "stream": {"mode": "upstream-token-delta", "contextTokenBudget": settings.context_token_budget, "maxOutputTokens": settings.max_output_tokens}, "chat": {"defaultModel": settings.llm_model if configured else "local-grounded-fallback", "deepThinkingModel": settings.llm_model if configured else "local-grounded-fallback", "candidates": candidates}, "embedding": {"defaultModel": settings.embedding_model if embedding_configured else "local-hash-embedding", "candidates": [{"id": settings.embedding_model if embedding_configured else "local-hash-embedding", "provider": "openai-compatible" if embedding_configured else "local", "model": settings.embedding_model if embedding_configured else "deterministic-hash", "dimension": settings.embedding_dimension, "enabled": True}]}, "rerank": {"defaultModel": settings.rerank_model if rerank_configured else "local-feature-reranker", "candidates": [{"id": settings.rerank_model if rerank_configured else "local-feature-reranker", "provider": "model-api" if rerank_configured else "local", "model": settings.rerank_model if rerank_configured else "feature-reranker", "enabled": True}]}}
     })
 
 

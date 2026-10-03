@@ -51,7 +51,8 @@ class Settings:
     retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "5"))
     rrf_k: int = int(os.getenv("RRF_K", "60"))
     agent_max_steps: int = int(os.getenv("AGENT_MAX_STEPS", "5"))
-    max_context_chars: int = int(os.getenv("MAX_CONTEXT_CHARS", "10000"))
+    context_token_budget: int = int(os.getenv("CONTEXT_TOKEN_BUDGET", "6000"))
+    max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
     seed_demo_data: bool = _env_bool("SEED_DEMO_DATA", True)
 
 

@@ -11,9 +11,10 @@
 3. ReAct 规划：模型读取 `ToolRegistry` 生成的 Function Calling Schema，自主选择工具。
 4. 混合检索：BM25 与 Embedding + Qdrant 双路召回，使用 RRF 融合和 Rerank 重排。
 5. Observation：工具结果以 `role=tool` 回填，模型可继续选择工具，最多执行限定轮次。
-6. 模型路由：优先调用 OpenAI 兼容模型，失败时切换备用模型，最后降级为本地 Planner 与有依据回答。
-7. SSE 输出：兼容原前端的 `meta/message/finish/done` 事件。
-8. Trace：逐轮记录 Plan、Action、Observation 和最终生成节点。
+6. 上下文工程：按相关度筛选和去重证据，结构化组装问题、意图、证据、工具结果与历史，并使用 `tiktoken` 执行预算截断。
+7. 模型路由：优先调用 OpenAI 兼容模型，失败时切换备用模型，最后降级为本地 Planner 与有依据回答。
+8. Token 流：最终模型请求使用 `stream=true`，每个上游 `delta.content` 立即转发为 SSE `message` 事件。
+9. Trace：逐轮记录 Plan、Action、Observation、上下文 Token 用量和最终生成节点。
 
 ## 启动
 
@@ -45,4 +46,6 @@ $env:LLM_MODEL = "deepseek-chat"
 不配置 Key 时系统仍可运行，会使用本地检索证据生成可核验的降级回答。
 
 Embedding 与 Rerank 可分别通过 `EMBEDDING_*`、`RERANK_*` 环境变量接入服务；留空时使用本地确定性实现。完整字段见 `.env.example`。
+
+`CONTEXT_TOKEN_BUDGET` 控制送入最终生成模型的上下文总预算，`MAX_OUTPUT_TOKENS` 控制回答上限。配置 LLM 后输出为真实模型 Token 流；未配置 LLM 时使用明确标记的本地降级流。
 

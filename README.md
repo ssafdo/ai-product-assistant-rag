@@ -8,7 +8,7 @@
 [![CI](https://github.com/ssafdo/ai-product-assistant-rag/actions/workflows/ci.yml/badge.svg)](https://github.com/ssafdo/ai-product-assistant-rag/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 
-这不是一个只封装大模型接口的聊天 Demo。项目实现了从文档入库、Embedding、BM25 + 向量混合召回、Rerank 到多轮 ReAct 工具调用、SSE 回答和链路追踪的完整闭环，并提供知识库、意图树、术语映射、用户和 Trace 管理后台。
+这不是一个只封装大模型接口的聊天 Demo。项目实现了从文档入库、Embedding、BM25 + 向量混合召回、Rerank 到多轮 ReAct 工具调用、模型 Token 流式回答和链路追踪的完整闭环，并提供知识库、意图树、术语映射、用户和 Trace 管理后台。
 
 Python 后端使用 SQLite 保存业务数据，Qdrant Local Mode 持久化向量；默认的确定性 Embedding、Rerank 和 ReAct Planner 可离线演示，配置兼容 API 后即可切换为真实 Embedding、Rerank 与大模型 Function Calling。
 
@@ -33,7 +33,9 @@ flowchart LR
     RRF --> RR[Rerank]
     RR -->|Observation| PLAN
     TR -->|其他业务 Observation| PLAN
-    PLAN -->|Final Answer| SSE[SSE 流式输出]
+    PLAN -->|Final Answer| CTX[证据筛选与 Token 预算组装]
+    CTX --> LLM[模型 stream=true]
+    LLM --> SSE[Token Delta 实时转发]
     RW -.-> TRACE[Trace 可观测链路]
     IR -.-> TRACE
     PLAN -.-> TRACE
@@ -55,6 +57,8 @@ flowchart LR
 - **四阶段混合检索**：标准 BM25 稀疏召回与 Qdrant 向量召回并行，经 RRF 消除分数量纲差异，再使用独立 Rerank 模型重排。
 - **可插拔模型能力**：Embedding 和 Rerank 均支持独立兼容 API；未配置 Key 时使用确定性本地实现，确保仓库可直接运行。
 - **可解释回答**：回答使用 `[资料N]` 标注依据，并返回 BM25、向量、Rerank 三阶段分数和检索通道。
+- **真实 Token 流**：最终模型请求启用 `stream=true`，后端解析上游 `delta.content` 并原样转发为 SSE，不对完整答案进行字符串切片伪流式处理。
+- **Token 预算上下文**：按相关度筛选并去重证据，将问题、意图、证据、工具 Observation 和最近对话分区组装，通过 `tiktoken` 精确计数并按优先级截断。
 - **模型路由与降级**：支持两个 OpenAI 兼容模型顺序容错；无 API Key 时仍能完整运行和演示。
 - **知识治理**：支持文档上传、结构感知切分、分块编辑、启停、重建、入库日志和流水线管理。
 - **端到端可观测性**：逐轮记录 Plan、Action、Observation、模型路由、耗时和结果，便于定位工具选择与召回问题。
@@ -65,11 +69,11 @@ flowchart LR
 | 模块 | 技术 |
 | --- | --- |
 | Python 后端 | Python 3.11+、FastAPI、SQLite、httpx、Pydantic |
-| Agent / RAG | ReAct、OpenAI Function Calling、Tool Registry、BM25、RRF、Rerank |
+| Agent / RAG | ReAct、OpenAI Function Calling、Tool Registry、BM25、RRF、Rerank、Token Budget |
 | Embedding / Vector DB | OpenAI-compatible Embeddings、Qdrant Local Mode |
 | 前端 | React 18、TypeScript、Vite、Tailwind CSS、Zustand、Recharts |
 | 文档处理 | Markdown / TXT、PDF、DOCX、结构感知切分 |
-| 接口与流式输出 | REST、SSE、OpenAI-compatible API |
+| 接口与流式输出 | REST、SSE、OpenAI-compatible Token Streaming |
 | 工程化 | Pytest、Vite Build、GitHub Actions |
 
 ## 快速启动
@@ -117,6 +121,8 @@ EMBEDDING_MODEL=text-embedding-3-small
 RERANK_API_KEY=your-api-key
 RERANK_URL=https://api.siliconflow.cn/v1/rerank
 RERANK_MODEL=BAAI/bge-reranker-v2-m3
+CONTEXT_TOKEN_BUDGET=6000
+MAX_OUTPUT_TOKENS=1200
 ```
 
 适用于 DeepSeek、通义千问、SiliconFlow 和其他 OpenAI 兼容服务。不配置 Key 时自动使用本地有依据降级回答。
@@ -131,6 +137,7 @@ RERANK_MODEL=BAAI/bge-reranker-v2-m3
 │   │   ├── rag.py          # 产品 Agent 编排、工具与 Trace
 │   │   ├── react_agent.py  # Tool Registry、Function Calling 与 ReAct 循环
 │   │   ├── retrieval.py    # Embedding、Qdrant、BM25、RRF 与 Rerank
+│   │   ├── context_engineering.py # 证据筛选、结构化组装与 Token 预算
 │   │   ├── database.py     # SQLite Schema、认证与种子数据
 │   │   └── config.py       # 环境配置
 │   └── tests/              # Python 单元测试

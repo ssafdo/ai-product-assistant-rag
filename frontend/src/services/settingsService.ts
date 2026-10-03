@@ -48,7 +48,9 @@ export interface SystemSettings {
       openDurationMs: number;
     };
     stream: {
-      messageChunkSize: number;
+      mode: string;
+      contextTokenBudget: number;
+      maxOutputTokens: number;
     };
     chat: ModelGroup;
     embedding: ModelGroup;

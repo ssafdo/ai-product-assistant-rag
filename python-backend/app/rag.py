@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
 from .config import settings
+from .context_engineering import ContextAssembler
 from .database import db, dumps, new_id, now_iso
 from .react_agent import OpenAIToolCallingModel, ReActEngine, ToolRegistry
 from .retrieval import HybridRetriever, SearchHit, index_chunks, remove_chunks, tokenize
@@ -195,32 +197,19 @@ class IntentRouter:
         return best
 
 
-class ContextBuilder:
-    def build(self, question: str, history: list[dict[str, str]], hits: list[SearchHit]) -> str:
-        # GSSC: gather is done by retrieval/history, then select, structure and compress here.
-        selected: list[str] = []
-        used = 0
-        for index, hit in enumerate(hits, start=1):
-            block = f"[资料{index}] {hit.document_name}\n{hit.content.strip()}"
-            if used + len(block) > settings.max_context_chars:
-                remaining = settings.max_context_chars - used
-                if remaining > 200:
-                    selected.append(block[:remaining])
-                break
-            selected.append(block)
-            used += len(block)
-        recent = history[-8:]
-        history_text = "\n".join(f"{item['role']}: {item['content'][:600]}" for item in recent)
-        return (
-            "[Instruction]\n你是严谨的 AI 产品智能助手。只依据证据回答；资料不足时明确说明，"
-            "不得编造价格、合同、客户隐私或未发布路线图。回答中用 [资料N] 标注依据。\n\n"
-            f"[Question]\n{question}\n\n[Evidence]\n" + ("\n\n".join(selected) or "未检索到相关资料")
-            + f"\n\n[Context]\n{history_text or '无历史对话'}"
-        )
-
-
 class ModelRouter:
-    async def complete(self, context: str, intent: dict[str, Any], hits: list[SearchHit]) -> tuple[str, str]:
+    def __init__(self, client_factory: Callable[[], httpx.AsyncClient] | None = None) -> None:
+        self.client_factory = client_factory or (lambda: httpx.AsyncClient(timeout=60))
+
+    async def stream_complete(
+        self,
+        context: str,
+        intent: dict[str, Any],
+        hits: list[SearchHit],
+        on_token: Callable[[str], Awaitable[None]],
+        cancelled: Callable[[], bool] | None = None,
+        fallback_answer: str | None = None,
+    ) -> tuple[str, str]:
         providers = []
         if settings.llm_api_key:
             providers.append((settings.llm_base_url, settings.llm_api_key, settings.llm_model, "primary"))
@@ -232,24 +221,50 @@ class ModelRouter:
         if intent.get("prompt"):
             system += "\n意图约束：" + intent["prompt"]
         for base_url, api_key, model, route_name in providers:
+            answer_parts: list[str] = []
             try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    response = await client.post(
+                async with self.client_factory() as client:
+                    async with client.stream(
+                        "POST",
                         f"{base_url.rstrip('/')}/chat/completions",
                         headers={"Authorization": f"Bearer {api_key}"},
                         json={
                             "model": model,
                             "messages": [{"role": "system", "content": system}, {"role": "user", "content": context}],
                             "temperature": 0.2,
+                            "max_tokens": settings.max_output_tokens,
+                            "stream": True,
                         },
-                    )
-                    response.raise_for_status()
-                    answer = response.json()["choices"][0]["message"]["content"].strip()
-                    if answer:
-                        return answer, f"{route_name}:{model}"
-            except (httpx.HTTPError, KeyError, IndexError, TypeError):
+                    ) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if cancelled and cancelled():
+                                break
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if not data or data == "[DONE]":
+                                continue
+                            payload = json.loads(data)
+                            delta = payload["choices"][0].get("delta", {}).get("content")
+                            if delta:
+                                answer_parts.append(delta)
+                                await on_token(delta)
+                if answer_parts:
+                    return "".join(answer_parts), f"{route_name}:{model}:stream"
+            except (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+                if answer_parts:
+                    return "".join(answer_parts), f"{route_name}:{model}:partial-stream"
                 continue
-        return self._grounded_fallback(hits), "local-grounded-fallback"
+        fallback = fallback_answer or self._grounded_fallback(hits)
+        emitted: list[str] = []
+        for index in range(0, len(fallback), 24):
+            if cancelled and cancelled():
+                break
+            delta = fallback[index : index + 24]
+            emitted.append(delta)
+            await on_token(delta)
+        return "".join(emitted), "local-grounded-fallback"
 
     @staticmethod
     def _grounded_fallback(hits: list[SearchHit]) -> str:
@@ -324,7 +339,7 @@ class ProductAssistantAgent:
     def __init__(self, retriever: HybridRetriever | None = None, tool_model: Any | None = None) -> None:
         self.retriever = retriever or HybridRetriever()
         self.intent_router = IntentRouter()
-        self.context_builder = ContextBuilder()
+        self.context_assembler = ContextAssembler(settings.context_token_budget)
         self.model_router = ModelRouter()
         self.tools = ToolRegistry()
         self.tools.register(
@@ -431,6 +446,8 @@ class ProductAssistantAgent:
         user: dict[str, Any],
         history: list[dict[str, str]],
         deep_thinking: bool = False,
+        on_token: Callable[[str], Awaitable[None]] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> AgentResult:
         trace = TraceRecorder(conversation_id, task_id, user)
         try:
@@ -467,24 +484,48 @@ class ProductAssistantAgent:
                 name = names[phase]
                 trace.node(name, phase, started, payload, {"step": step})
 
-            started = time.perf_counter()
             react_result = await self.react.run(system_prompt, user_prompt, record_react)
             hits = self._hits_from_observations(react_result.observations)
-            answer = react_result.answer
-            if not answer or answer == "__LOCAL_FINAL__":
-                answer = self._task_fallback(react_result.observations) or self.model_router._grounded_fallback(hits)
-            if react_result.stopped_by_limit:
-                answer = self._task_fallback(react_result.observations) or self.model_router._grounded_fallback(hits)
-            route = react_result.route
+            context_started = time.perf_counter()
+            context = self.context_assembler.build(
+                question,
+                rewritten,
+                intent,
+                history,
+                hits,
+                react_result.observations,
+            )
+            hits = context.selected_hits
+            trace.node(
+                "上下文筛选与预算组装",
+                "context",
+                context_started,
+                {"tokenCount": context.token_count, **context.stats},
+            )
+
+            async def discard(_: str) -> None:
+                return None
+
+            fallback_answer = self._task_fallback(react_result.observations)
+            generation_started = time.perf_counter()
+            answer, route = await self.model_router.stream_complete(
+                context.prompt,
+                intent,
+                hits,
+                on_token or discard,
+                cancelled,
+                fallback_answer,
+            )
             trace.node(
                 "ReAct 最终回答",
                 "generation",
-                started,
+                generation_started,
                 {
                     "route": route,
                     "steps": react_result.steps,
                     "observations": len(react_result.observations),
                     "stoppedByLimit": react_result.stopped_by_limit,
+                    "contextTokens": context.token_count,
                     "answerChars": len(answer),
                 },
             )

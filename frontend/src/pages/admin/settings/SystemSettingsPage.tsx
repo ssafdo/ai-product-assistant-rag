@@ -175,10 +175,12 @@ export function SystemSettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle>流式响应</CardTitle>
-          <CardDescription>输出分片大小</CardDescription>
+          <CardDescription>上游模型 Token 增量实时透传</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
-          <InfoItem label="Message Chunk Size" value={ai.stream.messageChunkSize} />
+        <CardContent className="grid gap-4 md:grid-cols-3">
+          <InfoItem label="Streaming Mode" value={ai.stream.mode} />
+          <InfoItem label="Context Token Budget" value={ai.stream.contextTokenBudget} />
+          <InfoItem label="Max Output Tokens" value={ai.stream.maxOutputTokens} />
         </CardContent>
       </Card>
 
