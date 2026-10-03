@@ -59,6 +59,7 @@ flowchart LR
 - **可解释回答**：回答使用 `[资料N]` 标注依据，并返回 BM25、向量、Rerank 三阶段分数和检索通道。
 - **真实 Token 流**：最终模型请求启用 `stream=true`，后端解析上游 `delta.content` 并原样转发为 SSE，不对完整答案进行字符串切片伪流式处理。
 - **Token 预算上下文**：按相关度筛选并去重证据，将问题、意图、证据、工具 Observation 和最近对话分区组装，通过 `tiktoken` 精确计数并按优先级截断。
+- **完整生成中止**：以 `taskId + userId` 登记活动生成任务，停止时直接取消 AsyncIO Worker 并关闭模型 HTTP Stream；支持越权校验、重复停止幂等、部分回答持久化、`cancel/done` 事件、断连清理和 `cancelled` Trace。
 - **模型路由与降级**：支持两个 OpenAI 兼容模型顺序容错；无 API Key 时仍能完整运行和演示。
 - **知识治理**：支持文档上传、结构感知切分、分块编辑、启停、重建、入库日志和流水线管理。
 - **端到端可观测性**：逐轮记录 Plan、Action、Observation、模型路由、耗时和结果，便于定位工具选择与召回问题。
@@ -138,6 +139,7 @@ MAX_OUTPUT_TOKENS=1200
 │   │   ├── react_agent.py  # Tool Registry、Function Calling 与 ReAct 循环
 │   │   ├── retrieval.py    # Embedding、Qdrant、BM25、RRF 与 Rerank
 │   │   ├── context_engineering.py # 证据筛选、结构化组装与 Token 预算
+│   │   ├── generation_tasks.py # 活动任务登记、归属校验与协作式取消
 │   │   ├── database.py     # SQLite Schema、认证与种子数据
 │   │   └── config.py       # 环境配置
 │   └── tests/              # Python 单元测试

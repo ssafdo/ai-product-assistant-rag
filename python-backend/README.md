@@ -14,7 +14,8 @@
 6. 上下文工程：按相关度筛选和去重证据，结构化组装问题、意图、证据、工具结果与历史，并使用 `tiktoken` 执行预算截断。
 7. 模型路由：优先调用 OpenAI 兼容模型，失败时切换备用模型，最后降级为本地 Planner 与有依据回答。
 8. Token 流：最终模型请求使用 `stream=true`，每个上游 `delta.content` 立即转发为 SSE `message` 事件。
-9. Trace：逐轮记录 Plan、Action、Observation、上下文 Token 用量和最终生成节点。
+9. 生成中止：停止接口校验任务归属并取消实际 AsyncIO Worker，关闭规划或生成 HTTP 请求，保存部分回答并发送 `cancel/done`。
+10. Trace：逐轮记录 Plan、Action、Observation、上下文 Token 用量和最终生成节点；取消任务落为 `cancelled` 而非长期停留在 `running`。
 
 ## 启动
 
@@ -48,4 +49,6 @@ $env:LLM_MODEL = "deepseek-chat"
 Embedding 与 Rerank 可分别通过 `EMBEDDING_*`、`RERANK_*` 环境变量接入服务；留空时使用本地确定性实现。完整字段见 `.env.example`。
 
 `CONTEXT_TOKEN_BUDGET` 控制送入最终生成模型的上下文总预算，`MAX_OUTPUT_TOKENS` 控制回答上限。配置 LLM 后输出为真实模型 Token 流；未配置 LLM 时使用明确标记的本地降级流。
+
+`POST /api/product-assistant/rag/v3/stop?taskId=...` 是幂等停止接口：活动任务首次返回 `cancelling`，重复调用返回 `already_cancelling`，任务完成或不存在返回 `not_found_or_finished`；其他用户的任务返回 403。
 

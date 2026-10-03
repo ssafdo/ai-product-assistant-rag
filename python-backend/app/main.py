@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .config import settings
 from .database import db, dumps, hash_password, loads, new_id, now_iso, verify_password
+from .generation_tasks import GenerationControl, generation_tasks
 from .rag import agent, document_to_api, get_document, ingest_text, seed_product_knowledge, structure_chunks, tokenize
 from .retrieval import close_vector_store, index_chunks, remove_chunks
 
@@ -111,6 +112,7 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        await generation_tasks.cancel_all()
         close_vector_store()
 
 
@@ -639,12 +641,28 @@ def chunk_logs(doc_id: str, current: int = 1, size: int = 10, _: dict[str, Any] 
     return ok(page(records, total, current, size))
 
 
-STOPPED_TASKS: set[str] = set()
-
-
 def sse(event: str, payload: Any) -> str:
     data = json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
     return f"event: {event}\ndata: {data}\n\n"
+
+
+def persist_assistant_message(conversation_id: str, content: str) -> str:
+    with db.connect() as connection:
+        cursor = connection.execute(
+            "INSERT INTO messages(conversation_id, role, content, create_time) VALUES (?, 'assistant', ?, ?)",
+            (conversation_id, content, now_iso()),
+        )
+        connection.execute("UPDATE conversations SET update_time=? WHERE id=?", (now_iso(), conversation_id))
+    return str(cursor.lastrowid)
+
+
+def trace_id_for_task(task_id: str) -> str | None:
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT trace_id FROM traces WHERE task_id=? ORDER BY start_time DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    return row["trace_id"] if row else None
 
 
 @app.get(PREFIX + "/rag/v3/chat")
@@ -677,11 +695,20 @@ async def rag_chat(
         connection.execute("INSERT INTO messages(conversation_id, role, content, create_time) VALUES (?, 'user', ?, ?)", (conversation_id, question, timestamp))
 
     async def generate():
-        yield sse("meta", {"conversationId": conversation_id, "taskId": task_id})
+        control = GenerationControl(
+            task_id=task_id,
+            user_id=user["id"],
+            conversation_id=conversation_id,
+            loop=asyncio.get_running_loop(),
+        )
+        generation_tasks.register(control)
         token_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        emitted = ""
+        agent_task: asyncio.Task[Any] | None = None
 
         async def forward_token(delta: str) -> None:
-            await token_queue.put(delta)
+            if not control.cancelled:
+                await token_queue.put(delta)
 
         async def execute_agent():
             try:
@@ -693,57 +720,79 @@ async def rag_chat(
                     history,
                     deepThinking,
                     on_token=forward_token,
-                    cancelled=lambda: task_id in STOPPED_TASKS,
+                    cancelled=lambda: control.cancelled,
                 )
             finally:
                 await token_queue.put(None)
 
-        agent_task = asyncio.create_task(execute_agent())
         try:
+            agent_task = asyncio.create_task(execute_agent(), name=f"generation-{task_id}")
+            generation_tasks.bind(task_id, agent_task)
+            await asyncio.sleep(0)
+            yield sse("meta", {"conversationId": conversation_id, "taskId": task_id})
             if deepThinking:
                 yield sse("message", {"type": "think", "delta": "正在规划工具、筛选证据并组装上下文。"})
-            emitted = ""
             while True:
                 delta = await token_queue.get()
                 if delta is None:
                     break
-                if task_id in STOPPED_TASKS:
+                if control.cancelled:
                     continue
                 emitted += delta
                 yield sse("message", {"type": "response", "delta": delta})
             result = await agent_task
-            with db.connect() as connection:
-                cursor = connection.execute(
-                    "INSERT INTO messages(conversation_id, role, content, create_time) VALUES (?, 'assistant', ?, ?)",
-                    (conversation_id, emitted, now_iso()),
-                )
-                message_id = cursor.lastrowid
-                connection.execute("UPDATE conversations SET update_time=? WHERE id=?", (now_iso(), conversation_id))
+            if control.cancelled:
+                raise asyncio.CancelledError
+            message_id = persist_assistant_message(conversation_id, emitted)
             payload = {
-                "messageId": str(message_id), "title": title, "traceId": result.trace_id,
+                "messageId": message_id, "title": title, "traceId": result.trace_id,
                 "modelRoute": result.model_route, "sources": [hit.as_dict() for hit in result.hits],
             }
-            if task_id in STOPPED_TASKS:
-                yield sse("cancel", payload)
-            else:
-                yield sse("finish", payload)
+            yield sse("finish", payload)
+            yield sse("done", {})
+        except asyncio.CancelledError:
+            if not control.cancelled:
+                generation_tasks.disconnect(task_id)
+                cancelled_content = emitted.rstrip()
+                if cancelled_content:
+                    persist_assistant_message(conversation_id, cancelled_content + "\n\n（连接中断，已停止生成）")
+                raise
+            cancelled_content = emitted.rstrip()
+            stored_content = (
+                cancelled_content + "\n\n（已停止生成）" if cancelled_content else "（已停止生成）"
+            )
+            message_id = persist_assistant_message(conversation_id, stored_content)
+            yield sse("cancel", {
+                "messageId": message_id,
+                "title": title,
+                "traceId": trace_id_for_task(task_id),
+                "modelRoute": "cancelled",
+                "sources": [],
+                "reason": control.cancel_reason,
+            })
             yield sse("done", {})
         except Exception as exc:
             yield sse("error", {"error": str(exc)})
         finally:
-            if not agent_task.done():
+            if agent_task and not agent_task.done():
+                generation_tasks.disconnect(task_id)
                 agent_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await agent_task
-            STOPPED_TASKS.discard(task_id)
+            generation_tasks.unregister(task_id, control)
 
     return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post(PREFIX + "/rag/v3/stop")
-def stop_task(taskId: str, _: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    STOPPED_TASKS.add(taskId)
-    return ok()
+async def stop_task(taskId: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    task_id = taskId.strip()
+    if not task_id:
+        fail("任务 ID 不能为空")
+    status = generation_tasks.cancel(task_id, user["id"])
+    if status == "forbidden":
+        fail("无权停止该生成任务", 403)
+    return ok({"taskId": task_id, "status": status})
 
 
 @app.get(PREFIX + "/conversations")

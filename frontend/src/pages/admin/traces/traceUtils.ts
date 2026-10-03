@@ -4,7 +4,7 @@ export const PAGE_SIZE = 10;
 
 export type BadgeVariant = "default" | "secondary" | "destructive" | "outline";
 
-export type TraceStatus = "" | "success" | "failed" | "running";
+export type TraceStatus = "" | "success" | "failed" | "running" | "cancelled";
 
 export type TraceFilters = {
   traceId: string;
@@ -32,7 +32,8 @@ export const STATUS_OPTIONS: { value: TraceStatus; label: string }[] = [
   { value: "", label: "全部状态" },
   { value: "running", label: "运行中" },
   { value: "success", label: "成功" },
-  { value: "failed", label: "失败" }
+  { value: "failed", label: "失败" },
+  { value: "cancelled", label: "已取消" }
 ];
 
 export const normalizeStatus = (status?: string | null): string => (status || "").trim().toLowerCase();
@@ -43,6 +44,7 @@ export const statusLabel = (status?: string | null): string => {
   if (normalized === "success") return "SUCCESS";
   if (normalized === "failed") return "FAILED";
   if (normalized === "running") return "RUNNING";
+  if (normalized === "cancelled") return "CANCELLED";
   if (normalized === "timeout") return "TIMEOUT";
   return normalized.toUpperCase();
 };
@@ -51,6 +53,7 @@ export const statusBadgeVariant = (status?: string | null): BadgeVariant => {
   const normalized = normalizeStatus(status);
   if (normalized === "failed" || normalized === "timeout") return "destructive";
   if (normalized === "running") return "secondary";
+  if (normalized === "cancelled") return "outline";
   if (normalized === "success") return "default";
   return "outline";
 };

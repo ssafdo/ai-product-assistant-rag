@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -264,6 +265,7 @@ class ModelRouter:
             delta = fallback[index : index + 24]
             emitted.append(delta)
             await on_token(delta)
+            await asyncio.sleep(0)
         return "".join(emitted), "local-grounded-fallback"
 
     @staticmethod
@@ -484,7 +486,7 @@ class ProductAssistantAgent:
                 name = names[phase]
                 trace.node(name, phase, started, payload, {"step": step})
 
-            react_result = await self.react.run(system_prompt, user_prompt, record_react)
+            react_result = await self.react.run(system_prompt, user_prompt, record_react, cancelled)
             hits = self._hits_from_observations(react_result.observations)
             context_started = time.perf_counter()
             context = self.context_assembler.build(
@@ -538,6 +540,9 @@ class ProductAssistantAgent:
                 )
             trace.finish()
             return AgentResult(answer, rewritten, intent, hits, route, trace.trace_id, task_id, thinking)
+        except asyncio.CancelledError:
+            trace.finish("cancelled", "生成任务已取消")
+            raise
         except Exception as exc:
             trace.finish("error", str(exc)[:1000])
             raise

@@ -282,7 +282,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           })
         }));
         if (get().cancelRequested) {
-          stopTask(payload.taskId).catch(() => null);
+          stopTask(payload.taskId).catch(() => get().streamAbort?.());
         }
       },
       onMessage: (payload: MessageDeltaPayload) => {
@@ -452,16 +452,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
   cancelGeneration: () => {
-    const { isStreaming, streamTaskId } = get();
+    const { isStreaming, streamTaskId, streamAbort } = get();
     if (!isStreaming) return;
     set({ cancelRequested: true });
     if (streamTaskId) {
-      stopTask(streamTaskId).catch(() => null);
+      stopTask(streamTaskId).catch(() => streamAbort?.());
     }
   },
   appendStreamContent: (delta) => {
     if (!delta) return;
     set((state) => {
+      if (state.cancelRequested) return state;
       const shouldFinalizeThinking = state.thinkingStartAt != null;
       const duration = computeThinkingDuration(state.thinkingStartAt);
       return {
@@ -482,20 +483,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
   appendThinkingContent: (delta) => {
     if (!delta) return;
-    set((state) => ({
-      thinkingStartAt: state.thinkingStartAt ?? Date.now(),
-      messages: state.messages.map((message) =>
-        message.id === state.streamingMessageId &&
-        message.status !== "cancelled" &&
-        message.status !== "error"
-          ? {
-              ...message,
-              thinking: `${message.thinking ?? ""}${delta}`,
-              isThinking: true
-            }
-          : message
-      )
-    }));
+    set((state) => {
+      if (state.cancelRequested) return state;
+      return {
+        thinkingStartAt: state.thinkingStartAt ?? Date.now(),
+        messages: state.messages.map((message) =>
+          message.id === state.streamingMessageId &&
+          message.status !== "cancelled" &&
+          message.status !== "error"
+            ? {
+                ...message,
+                thinking: `${message.thinking ?? ""}${delta}`,
+                isThinking: true
+              }
+            : message
+        )
+      };
+    });
   },
   submitFeedback: async (messageId, feedback) => {
     const vote = feedback === "like" ? 1 : feedback === "dislike" ? -1 : null;

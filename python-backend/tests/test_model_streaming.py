@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import suppress
 from types import SimpleNamespace
 
 import httpx
@@ -47,3 +48,47 @@ def test_model_router_forwards_upstream_sse_deltas_without_rechunking(monkeypatc
 
 async def _append(target: list[str], value: str) -> None:
     target.append(value)
+
+
+def test_cancelling_generation_closes_upstream_http_stream(monkeypatch) -> None:
+    class SlowStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"first"}}]}\n\n'
+            await asyncio.Event().wait()
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = SlowStream()
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, headers={"content-type": "text/event-stream"})
+
+    monkeypatch.setattr(rag_module, "settings", SimpleNamespace(
+        llm_api_key="key",
+        llm_base_url="https://model.example/v1",
+        llm_model="chat-model",
+        secondary_api_key="",
+        secondary_base_url="",
+        secondary_model="",
+        max_output_tokens=100,
+    ))
+    router = ModelRouter(lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    async def scenario() -> None:
+        first_token = asyncio.Event()
+
+        async def receive(_: str) -> None:
+            first_token.set()
+
+        task = asyncio.create_task(router.stream_complete("context", {}, [], receive))
+        await asyncio.wait_for(first_token.wait(), timeout=1)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+        assert stream.closed is True
+
+    asyncio.run(scenario())

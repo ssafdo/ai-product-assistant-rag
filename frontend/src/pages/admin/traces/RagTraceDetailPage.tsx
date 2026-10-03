@@ -55,12 +55,13 @@ const copyToClipboard = (text: string, label: string) => {
 
 // ============ 状态颜色 ============
 
-type StatusType = "success" | "failed" | "running" | "default";
+type StatusType = "success" | "failed" | "running" | "cancelled" | "default";
 
 const STATUS_COLORS: Record<StatusType, { dot: string; bar: string }> = {
   success: { dot: "bg-emerald-500", bar: "bg-emerald-400" },
   failed: { dot: "bg-red-500", bar: "bg-red-400" },
   running: { dot: "bg-amber-500", bar: "bg-amber-400" },
+  cancelled: { dot: "bg-zinc-500", bar: "bg-zinc-400" },
   default: { dot: "bg-slate-300", bar: "bg-slate-300" }
 };
 

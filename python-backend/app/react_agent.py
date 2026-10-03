@@ -187,6 +187,7 @@ class ReActEngine:
         system_prompt: str,
         user_prompt: str,
         trace: TraceCallback | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> ReActResult:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -195,7 +196,11 @@ class ReActEngine:
         observations: list[dict[str, Any]] = []
         route = "unknown"
         for step in range(1, self.max_steps + 1):
+            if cancelled and cancelled():
+                raise asyncio.CancelledError
             turn = await self.model.complete(messages, self.registry.schemas())
+            if cancelled and cancelled():
+                raise asyncio.CancelledError
             route = turn.route
             if trace:
                 trace(step, "plan", {
@@ -216,12 +221,16 @@ class ReActEngine:
             messages.append({"role": "assistant", "content": turn.content or None, "tool_calls": assistant_calls})
 
             for call in turn.tool_calls:
+                if cancelled and cancelled():
+                    raise asyncio.CancelledError
                 if trace:
                     trace(step, "action", {"tool": call.name, "arguments": call.arguments})
                 try:
                     result = json_value(await asyncio.to_thread(self.registry.execute, call.name, call.arguments))
                 except Exception as exc:
                     result = {"error": str(exc)}
+                if cancelled and cancelled():
+                    raise asyncio.CancelledError
                 observation = {"tool": call.name, "arguments": call.arguments, "result": result}
                 observations.append(observation)
                 messages.append({
